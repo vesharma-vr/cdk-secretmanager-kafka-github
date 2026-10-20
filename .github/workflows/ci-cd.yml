@@ -1,13 +1,11 @@
-# CI/CD for KafkaSimpleCdkStack (single-node KRaft Kafka on EC2).
+# CI for KafkaSimpleCdkStack (single-node KRaft Kafka on EC2).
 #
 #   build    install -> unit tests
-#   deploy   "production" environment approval -> cdk deploy -> smoke test
 #
-# Pull requests run `build` only. Pushes to main (and manual runs on main with
-# action=deploy) continue to `deploy`, which waits for the required reviewers
-# on the "production" environment. Tear-down lives in destroy.yml.
-# See "CI/CD with GitHub Actions" in the README for setup.
-name: CI/CD
+# Runs on pull requests into main, pushes to main, and manual runs. It needs
+# no AWS credentials: the tests synthesize offline from cdk.context.json.
+# Deploys are done by hand (see the README). Tear-down lives in destroy.yml.
+name: CI
 
 on:
   pull_request:
@@ -15,32 +13,15 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
-    inputs:
-      action:
-        description: deploy = build, approve, deploy, smoke test. plan = unit tests only.
-        type: choice
-        options: [deploy, plan]
-        default: deploy
-      run_smoke_tests:
-        description: After deploy, verify the broker end to end over SSM.
-        type: boolean
-        default: true
 
 permissions:
   contents: read
 
-env:
-  AWS_REGION: us-east-1
-  AWS_DEFAULT_REGION: us-east-1
-  STACK_NAME: KafkaSimpleCdkStack
-
 jobs:
   build:
-    name: Build & Verify
+    name: Unit tests
     runs-on: ubuntu-latest
     timeout-minutes: 30
-    permissions:
-      contents: read
     steps:
       - uses: actions/checkout@v7
 
@@ -54,49 +35,5 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: reports
-          path: reports/
-          if-no-files-found: ignore
-
-  deploy:
-    name: Deploy & Verify
-    needs: build
-    if: >-
-      github.ref == 'refs/heads/main' &&
-      (github.event_name == 'push' ||
-       (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy'))
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    # Required reviewers on this environment are the manual approval gate.
-    environment: production
-    # One writer per stack, shared with destroy.yml. Never cancel a running deploy.
-    concurrency:
-      group: cfn-KafkaSimpleCdkStack-us-east-1
-      cancel-in-progress: false
-    permissions:
-      contents: read
-      id-token: write
-    steps:
-      - uses: actions/checkout@v7
-
-      - uses: ./.github/actions/setup
-        with:
-          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
-          aws-region: ${{ env.AWS_REGION }}
-
-      - name: Deploy
-        run: |
-          cdk deploy "$STACK_NAME" \
-              --require-approval never \
-              --outputs-file reports/cdk-outputs.json
-
-      - name: Smoke test
-        if: github.event_name != 'workflow_dispatch' || inputs.run_smoke_tests
-        run: bash scripts/smoke_test.sh reports/cdk-outputs.json
-
-      - name: Upload deploy reports
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: deploy-reports
           path: reports/
           if-no-files-found: ignore

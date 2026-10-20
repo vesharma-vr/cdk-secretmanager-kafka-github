@@ -300,46 +300,25 @@ rm -rf .venv cdk.out
 
 ## CI/CD with GitHub Actions
 
-Two workflows automate Steps 1–8 above and Step 9:
+Two workflows run on GitHub-hosted `ubuntu-latest` runners:
 
-- [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) builds and verifies every PR, and
-  deploys on pushes to `main` after an environment approval.
-- [`.github/workflows/destroy.yml`](.github/workflows/destroy.yml) tears the stack down. It only
-  runs when you start it by hand.
+- [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) runs the unit tests on every PR
+  into `main`, every push to `main`, and on demand (*Run workflow*). It needs no AWS
+  credentials and never deploys. Deploys are done by hand (Steps 1–8 above).
+- [`.github/workflows/destroy.yml`](.github/workflows/destroy.yml) tears the stack down (Step 9).
+  It only runs when you start it by hand.
 
-Both run on GitHub-hosted `ubuntu-latest` runners and share the
-[`.github/actions/setup`](.github/actions/setup/action.yml) composite action. That action installs
-Python 3.13, `requirements-dev.txt`, Node 24, a pinned AWS CDK CLI (2.1145.0), and AWS credentials
-through **GitHub OIDC**, so no long-lived AWS keys are stored in GitHub. The runner image already
-provides the AWS CLI v2 and jq.
+Both share the [`.github/actions/setup`](.github/actions/setup/action.yml) composite action. That
+action installs Python 3.13, `requirements-dev.txt`, Node 24, a pinned AWS CDK CLI (2.1145.0),
+and, when given a role, AWS credentials through **GitHub OIDC**, so no long-lived AWS keys are
+stored in GitHub.
 
-```
-build (Build & Verify) ──►  production env  ─►  deploy (Deploy & Verify) ──►
-Unit tests                  (required           cdk deploy  →  Smoke test
-(pytest)                     reviewers)                         (SSM)
-```
-
-| Step | What it does | Fails / blocks when |
+| Step | What it does | Fails when |
 |---|---|---|
-| Setup | `requirements-dev.txt` (pytest, cfn-lint), CDK CLI, OIDC role assumption (deploy only; `build` needs no AWS credentials) | role can't be assumed |
+| Setup | `requirements-dev.txt` (pytest, cfn-lint), CDK CLI | install error |
 | Unit tests | [`tests/`](tests/test_kafka_cluster_stack.py): offline synth from `cdk.context.json`; asserts 1×t3.small, no key pair, only 9092 open, generated secret, secret-scoped IAM, no password in traced user data | any assertion fails |
-| Approval | `environment: production`, so the job waits for that environment's required reviewers | rejected / not approved in time |
-| Deploy | `cdk deploy`: synthesizes with the deploy role's credentials (VPC lookup served from the committed `cdk.context.json`) and deploys | synth or CloudFormation failure |
-| Smoke test | [`scripts/smoke_test.sh`](scripts/smoke_test.sh) over SSM Run Command: waits for SSM Online and for cloud-init + `kafka.service`, then does an authenticated create/produce/consume round-trip and confirms an **unauthenticated** client is rejected | any check fails |
 
-**What runs when**
-
-| Trigger | Jobs |
-|---|---|
-| Pull request into `main` | `build` only |
-| Push to `main` | `build` → approval → `deploy` |
-| *Run workflow* on CI/CD, `action=deploy` (from `main`) | `build` → approval → `deploy` (`run_smoke_tests` can switch off the smoke test) |
-| *Run workflow* on CI/CD, `action=plan` | `build` only (unit tests) |
-| *Run workflow* on Destroy (from `main`) | confirmation check → approval → `cdk destroy` |
-
-Deploy and destroy share the concurrency group `cfn-KafkaSimpleCdkStack-us-east-1`, so only one
-job touches the stack at a time, and a running deploy is never cancelled. If several deploys are
-queued, GitHub keeps only the newest pending one.
+The JUnit report is uploaded as the `reports` artifact.
 
 **Destroy inputs**
 
@@ -349,9 +328,11 @@ queued, GitHub keeps only the newest pending one.
 | `force_delete_secret` | also purge the broker secret, so you can redeploy immediately (see the Secrets Manager gotcha above) |
 
 Destroy runs `cdk destroy`, checks that the stack is gone, and optionally purges the secret. It
-also needs the `production` approval.
+only runs from `main` and needs the `production` environment's approval.
 
-### GitHub setup
+### GitHub setup (Destroy workflow only)
+
+CI needs no setup. The Destroy workflow needs AWS access:
 
 1. **OIDC provider in AWS** (once per account). Skip this if
    `token.actions.githubusercontent.com` already exists under IAM → Identity providers:
@@ -362,7 +343,7 @@ also needs the `production` approval.
      --client-id-list sts.amazonaws.com
    ```
 
-2. **Deploy role.** Create an IAM role that GitHub can assume. Its trust policy, with
+2. **Role.** Create an IAM role that GitHub can assume. Its trust policy, with
    `<ACCOUNT_ID>` and `<OWNER>/<REPO>` filled in:
 
    ```json
@@ -373,46 +354,30 @@ also needs the `production` approval.
        "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
        "Action": "sts:AssumeRoleWithWebIdentity",
        "Condition": {
-         "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
-         "StringLike": {
-           "token.actions.githubusercontent.com:sub": [
-             "repo:<OWNER>/<REPO>:environment:production"
-           ]
+         "StringEquals": {
+           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
+           "token.actions.githubusercontent.com:sub": "repo:<OWNER>/<REPO>:environment:production"
          }
        }
      }]
    }
    ```
 
-   The `sub` value covers the `deploy`/`destroy` jobs, which run in the `production`
-   environment. The `build` job only runs unit tests and never assumes a role.
+   The role needs:
 
-3. **Repository variables** (Settings → Secrets and variables → Actions → *Variables*). They
-   hold ARNs, not secrets:
+   - `sts:AssumeRole` on `arn:aws:iam::<ACCOUNT_ID>:role/cdk-hnb659fds-*-<ACCOUNT_ID>-us-east-1`
+     (CDK's bootstrap roles, which do the actual delete)
+   - `cloudformation:DescribeStacks` (post-destroy check)
+   - `secretsmanager:DeleteSecret` on `kafka-simple-cdk-broker-credentials-*`, only if you use
+     `force_delete_secret`
 
-   | Variable | Required | Value |
-   |---|---|---|
-   | `AWS_ROLE_ARN` | yes | the deploy role |
+3. **Repository variable** `AWS_ROLE_ARN` (Settings → Secrets and variables → Actions →
+   *Variables*) = the role's ARN.
 
 4. **Environment** (Settings → Environments → *New environment* `production`). Add **Required
-   reviewers**; this is the approval gate. Also restrict *Deployment branches* to `main`. To
-   deploy without approval, remove the reviewers.
+   reviewers**; this is the approval gate. Also restrict *Deployment branches* to `main`.
 
-5. **Bootstrap** the account/region once (Step 2). The pipeline never bootstraps, because bootstrapping is an account-level decision.
-
-**IAM permissions for the role.** CDK does the actual deploy through the bootstrap roles, so
-the GitHub role only needs:
-
-- `sts:AssumeRole` on `arn:aws:iam::<ACCOUNT_ID>:role/cdk-hnb659fds-*-<ACCOUNT_ID>-us-east-1`
-  (deploy, lookup and file-publishing roles)
-- `cloudformation:DescribeStacks` (post-destroy check)
-- `ssm:SendCommand` on the `AWS-RunShellScript` document and on instances tagged
-  `Project=kafka-simple-no-msk`, plus `ssm:GetCommandInvocation` and
-  `ssm:DescribeInstanceInformation` (smoke test)
-- `secretsmanager:DeleteSecret` on `kafka-simple-cdk-broker-credentials-*`, only if you use
-  `force_delete_secret`
-
-To run the smoke test by hand after a local deploy:
+To run the smoke test after a local deploy:
 
 ```bash
 npx aws-cdk@2 deploy --require-approval never --outputs-file cdk-outputs.json
