@@ -314,20 +314,17 @@ through **GitHub OIDC**, so no long-lived AWS keys are stored in GitHub. The run
 provides the AWS CLI v2 and jq.
 
 ```
-build (Build & Verify) ─────────────────────────────────────►  production env  ─►  deploy (Deploy & Verify) ────►
-Unit tests → Synth → Static analysis → Diff                     (required           cdk deploy  →  Smoke test
-(pytest)    (context-drift check)  (cfn-lint)  (bootstrap check)  reviewers)        (cdk.out artifact)  (SSM)
+build (Build & Verify) ──►  production env  ─►  deploy (Deploy & Verify) ──►
+Unit tests                  (required           cdk deploy  →  Smoke test
+(pytest)                     reviewers)                         (SSM)
 ```
 
 | Step | What it does | Fails / blocks when |
 |---|---|---|
-| Setup | `requirements-dev.txt` (pytest, cfn-lint), CDK CLI, OIDC role assumption | role can't be assumed |
+| Setup | `requirements-dev.txt` (pytest, cfn-lint), CDK CLI, OIDC role assumption (deploy only; `build` needs no AWS credentials) | role can't be assumed |
 | Unit tests | [`tests/`](tests/test_kafka_cluster_stack.py): offline synth from `cdk.context.json`; asserts 1×t3.small, no key pair, only 9092 open, generated secret, secret-scoped IAM, no password in traced user data | any assertion fails |
-| Synth | `cdk synth` | synth error. If synth had to do a fresh VPC lookup and changed `cdk.context.json`, lint and diff still run, then the job **fails** so nothing deploys. Commit `reports/cdk.context.json` from the `reports` artifact |
-| Static analysis | `cfn-lint` on the synthesized template | cfn-lint *errors* (warnings are only reported) |
-| Diff | checks the `CDKToolkit` bootstrap stack exists, then `cdk diff` → `reports/cdk-diff.txt` and the run's **job summary** | not bootstrapped |
 | Approval | `environment: production`, so the job waits for that environment's required reviewers | rejected / not approved in time |
-| Deploy | `cdk deploy --app cdk.out`: deploys the **exact** assembly that was linted and diffed (passed between jobs as the `cloud-assembly` artifact), not a re-synth | CloudFormation failure |
+| Deploy | `cdk deploy`: synthesizes with the deploy role's credentials (VPC lookup served from the committed `cdk.context.json`) and deploys | synth or CloudFormation failure |
 | Smoke test | [`scripts/smoke_test.sh`](scripts/smoke_test.sh) over SSM Run Command: waits for SSM Online and for cloud-init + `kafka.service`, then does an authenticated create/produce/consume round-trip and confirms an **unauthenticated** client is rejected | any check fails |
 
 **What runs when**
@@ -337,7 +334,7 @@ Unit tests → Synth → Static analysis → Diff                     (required 
 | Pull request into `main` | `build` only |
 | Push to `main` | `build` → approval → `deploy` |
 | *Run workflow* on CI/CD, `action=deploy` (from `main`) | `build` → approval → `deploy` (`run_smoke_tests` can switch off the smoke test) |
-| *Run workflow* on CI/CD, `action=plan` | `build` only (stops after the diff) |
+| *Run workflow* on CI/CD, `action=plan` | `build` only (unit tests) |
 | *Run workflow* on Destroy (from `main`) | confirmation check → approval → `cdk destroy` |
 
 Deploy and destroy share the concurrency group `cfn-KafkaSimpleCdkStack-us-east-1`, so only one
@@ -379,9 +376,7 @@ also needs the `production` approval.
          "StringEquals": { "token.actions.githubusercontent.com:aud": "sts.amazonaws.com" },
          "StringLike": {
            "token.actions.githubusercontent.com:sub": [
-             "repo:<OWNER>/<REPO>:environment:production",
-             "repo:<OWNER>/<REPO>:ref:refs/heads/main",
-             "repo:<OWNER>/<REPO>:pull_request"
+             "repo:<OWNER>/<REPO>:environment:production"
            ]
          }
        }
@@ -389,10 +384,8 @@ also needs the `production` approval.
    }
    ```
 
-   The three `sub` values cover the `deploy`/`destroy` jobs (which run in the `production`
-   environment) and the `build` job on `main` pushes and on PRs. To keep PR builds away from the
-   deploy role, create a second, read-only *plan* role trusted for only the last two subjects,
-   and drop them from the deploy role.
+   The `sub` value covers the `deploy`/`destroy` jobs, which run in the `production`
+   environment. The `build` job only runs unit tests and never assumes a role.
 
 3. **Repository variables** (Settings → Secrets and variables → Actions → *Variables*). They
    hold ARNs, not secrets:
@@ -400,28 +393,22 @@ also needs the `production` approval.
    | Variable | Required | Value |
    |---|---|---|
    | `AWS_ROLE_ARN` | yes | the deploy role |
-   | `AWS_PLAN_ROLE_ARN` | no | the read-only plan role for `build`. Falls back to `AWS_ROLE_ARN` |
 
 4. **Environment** (Settings → Environments → *New environment* `production`). Add **Required
    reviewers**; this is the approval gate. Also restrict *Deployment branches* to `main`. To
    deploy without approval, remove the reviewers.
 
-5. **Bootstrap** the account/region once (Step 2). The pipeline checks for it but never
-   bootstraps, because bootstrapping is an account-level decision.
+5. **Bootstrap** the account/region once (Step 2). The pipeline never bootstraps, because bootstrapping is an account-level decision.
 
-PRs from forks get no OIDC token, so their `build` job fails at the credentials step. That's
-intended: fork code never gets AWS access.
-
-**IAM permissions for the role(s).** CDK does the actual deploy through the bootstrap roles, so
+**IAM permissions for the role.** CDK does the actual deploy through the bootstrap roles, so
 the GitHub role only needs:
 
 - `sts:AssumeRole` on `arn:aws:iam::<ACCOUNT_ID>:role/cdk-hnb659fds-*-<ACCOUNT_ID>-us-east-1`
-  (deploy, lookup and file-publishing roles). A plan role only needs the lookup and deploy roles,
-  because `cdk diff` reads the current template through them.
-- `cloudformation:DescribeStacks` (bootstrap preflight, post-destroy check)
+  (deploy, lookup and file-publishing roles)
+- `cloudformation:DescribeStacks` (post-destroy check)
 - `ssm:SendCommand` on the `AWS-RunShellScript` document and on instances tagged
   `Project=kafka-simple-no-msk`, plus `ssm:GetCommandInvocation` and
-  `ssm:DescribeInstanceInformation` (smoke test, deploy role only)
+  `ssm:DescribeInstanceInformation` (smoke test)
 - `secretsmanager:DeleteSecret` on `kafka-simple-cdk-broker-credentials-*`, only if you use
   `force_delete_secret`
 
