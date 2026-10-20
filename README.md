@@ -298,84 +298,24 @@ rm -rf .venv cdk.out
 
 (Keep `cdk.context.json` — it's meant to be committed.)
 
-## CI/CD with GitHub Actions
+## CI with GitHub Actions
 
-Two workflows run on GitHub-hosted `ubuntu-latest` runners:
+[`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) runs the unit tests on every PR into
+`main`, every push to `main`, and on demand (*Run workflow*). It needs no AWS credentials and
+no setup, and never deploys or destroys anything: deploys (Steps 1–8) and clean-up (Step 9)
+are done by hand.
 
-- [`.github/workflows/ci-cd.yml`](.github/workflows/ci-cd.yml) runs the unit tests on every PR
-  into `main`, every push to `main`, and on demand (*Run workflow*). It needs no AWS
-  credentials and never deploys. Deploys are done by hand (Steps 1–8 above).
-- [`.github/workflows/destroy.yml`](.github/workflows/destroy.yml) tears the stack down (Step 9).
-  It only runs when you start it by hand.
-
-Both share the [`.github/actions/setup`](.github/actions/setup/action.yml) composite action. That
-action installs Python 3.13, `requirements-dev.txt`, Node 24, a pinned AWS CDK CLI (2.1145.0),
-and, when given a role, AWS credentials through **GitHub OIDC**, so no long-lived AWS keys are
-stored in GitHub.
+It runs on a GitHub-hosted `ubuntu-latest` runner, using the
+[`.github/actions/setup`](.github/actions/setup/action.yml) composite action to install
+Python 3.13, `requirements-dev.txt`, and Node 24 (for the jsii runtime the Python CDK library
+uses).
 
 | Step | What it does | Fails when |
 |---|---|---|
-| Setup | `requirements-dev.txt` (pytest, cfn-lint), CDK CLI | install error |
+| Setup | Python, `requirements-dev.txt`, Node | install error |
 | Unit tests | [`tests/`](tests/test_kafka_cluster_stack.py): offline synth from `cdk.context.json`; asserts 1×t3.small, no key pair, only 9092 open, generated secret, secret-scoped IAM, no password in traced user data | any assertion fails |
 
 The JUnit report is uploaded as the `reports` artifact.
-
-**Destroy inputs**
-
-| Input | Meaning |
-|---|---|
-| `confirm_stack_name` | must be exactly `KafkaSimpleCdkStack`, or nothing is destroyed |
-| `force_delete_secret` | also purge the broker secret, so you can redeploy immediately (see the Secrets Manager gotcha above) |
-
-Destroy runs `cdk destroy`, checks that the stack is gone, and optionally purges the secret. It
-only runs from `main` and needs the `production` environment's approval.
-
-### GitHub setup (Destroy workflow only)
-
-CI needs no setup. The Destroy workflow needs AWS access:
-
-1. **OIDC provider in AWS** (once per account). Skip this if
-   `token.actions.githubusercontent.com` already exists under IAM → Identity providers:
-
-   ```bash
-   aws iam create-open-id-connect-provider \
-     --url https://token.actions.githubusercontent.com \
-     --client-id-list sts.amazonaws.com
-   ```
-
-2. **Role.** Create an IAM role that GitHub can assume. Its trust policy, with
-   `<ACCOUNT_ID>` and `<OWNER>/<REPO>` filled in:
-
-   ```json
-   {
-     "Version": "2012-10-17",
-     "Statement": [{
-       "Effect": "Allow",
-       "Principal": { "Federated": "arn:aws:iam::<ACCOUNT_ID>:oidc-provider/token.actions.githubusercontent.com" },
-       "Action": "sts:AssumeRoleWithWebIdentity",
-       "Condition": {
-         "StringEquals": {
-           "token.actions.githubusercontent.com:aud": "sts.amazonaws.com",
-           "token.actions.githubusercontent.com:sub": "repo:<OWNER>/<REPO>:environment:production"
-         }
-       }
-     }]
-   }
-   ```
-
-   The role needs:
-
-   - `sts:AssumeRole` on `arn:aws:iam::<ACCOUNT_ID>:role/cdk-hnb659fds-*-<ACCOUNT_ID>-us-east-1`
-     (CDK's bootstrap roles, which do the actual delete)
-   - `cloudformation:DescribeStacks` (post-destroy check)
-   - `secretsmanager:DeleteSecret` on `kafka-simple-cdk-broker-credentials-*`, only if you use
-     `force_delete_secret`
-
-3. **Repository variable** `AWS_ROLE_ARN` (Settings → Secrets and variables → Actions →
-   *Variables*) = the role's ARN.
-
-4. **Environment** (Settings → Environments → *New environment* `production`). Add **Required
-   reviewers**; this is the approval gate. Also restrict *Deployment branches* to `main`.
 
 To run the smoke test after a local deploy:
 

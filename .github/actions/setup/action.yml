@@ -1,23 +1,7 @@
-# Shared toolchain for every job that touches the CDK app: Python deps, Node,
-# the pinned AWS CDK CLI, and (optionally) AWS credentials via GitHub OIDC.
-# The hosted ubuntu runner already ships the AWS CLI v2 and jq, which the
-# bootstrap preflight and scripts/smoke_test.sh rely on.
-name: Set up CDK toolchain
-description: Python + requirements-dev.txt, Node + pinned aws-cdk CLI, optional AWS OIDC credentials
-
-inputs:
-  role-to-assume:
-    description: IAM role ARN to assume through GitHub OIDC. Empty = no AWS credentials.
-    required: false
-    default: ""
-  aws-region:
-    description: AWS region for the credentials and the CLI.
-    required: false
-    default: us-east-1
-  cdk-cli-version:
-    description: aws-cdk CLI version installed from npm.
-    required: false
-    default: 2.1145.0
+# Shared toolchain for the unit tests: Python deps, plus Node for the jsii
+# runtime used by the Python CDK library.
+name: Set up test toolchain
+description: Python + requirements-dev.txt, Node
 
 runs:
   using: composite
@@ -32,19 +16,9 @@ runs:
       with:
         node-version: "24"
 
-    - name: Install Python deps and CDK CLI
+    - name: Install Python deps
       shell: bash
       run: |
         python -m pip install --quiet --upgrade pip
         python -m pip install --quiet -r requirements-dev.txt
-        npm install -g --no-fund --no-audit "aws-cdk@${{ inputs.cdk-cli-version }}"
-        cdk --version
         mkdir -p reports
-
-    - name: Configure AWS credentials (OIDC)
-      if: inputs.role-to-assume != ''
-      uses: aws-actions/configure-aws-credentials@v6
-      with:
-        role-to-assume: ${{ inputs.role-to-assume }}
-        aws-region: ${{ inputs.aws-region }}
-        role-session-name: gh-${{ github.run_id }}-${{ github.run_attempt }}

@@ -4,7 +4,7 @@
 #
 # Runs on pull requests into main, pushes to main, and manual runs. It needs
 # no AWS credentials: the tests synthesize offline from cdk.context.json.
-# Deploys are done by hand (see the README). Tear-down lives in destroy.yml.
+# Deploys and tear-downs are done by hand (see the README).
 name: CI
 
 on:
