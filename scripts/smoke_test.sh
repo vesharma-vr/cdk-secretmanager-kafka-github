@@ -1,8 +1,7 @@
 #!/usr/bin/env bash
 #
-# Post-deploy verification for KafkaSimpleCdkStack -- run by the GitHub
-# Actions "Smoke test" step (.github/workflows/ci-cd.yml), but works the same
-# from a laptop:
+# Post-deploy verification for KafkaSimpleCdkStack. Run it by hand after a
+# deploy:
 #
 #   scripts/smoke_test.sh cdk-outputs.json
 #
