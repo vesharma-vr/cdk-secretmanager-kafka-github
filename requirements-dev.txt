@@ -1,0 +1,3 @@
+-r requirements.txt
+pytest==9.1.1
+cfn-lint==1.57.2

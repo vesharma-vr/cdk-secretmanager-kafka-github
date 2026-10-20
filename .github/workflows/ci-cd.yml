@@ -1,0 +1,176 @@
+# CI/CD for KafkaSimpleCdkStack (single-node KRaft Kafka on EC2).
+#
+#   build    install -> unit tests -> cdk synth -> cfn-lint -> cdk diff
+#   deploy   "production" environment approval -> cdk deploy of the exact
+#            cdk.out built above -> smoke test
+#
+# Pull requests run `build` only. Pushes to main (and manual runs on main with
+# action=deploy) continue to `deploy`, which waits for the required reviewers
+# on the "production" environment. Tear-down lives in destroy.yml.
+# See "CI/CD with GitHub Actions" in the README for setup.
+name: CI/CD
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      action:
+        description: deploy = build, approve, deploy, smoke test. plan = stop after cdk diff.
+        type: choice
+        options: [deploy, plan]
+        default: deploy
+      run_smoke_tests:
+        description: After deploy, verify the broker end to end over SSM.
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+env:
+  AWS_REGION: us-east-1
+  AWS_DEFAULT_REGION: us-east-1
+  STACK_NAME: KafkaSimpleCdkStack
+
+jobs:
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      id-token: write   # OIDC token for aws-actions/configure-aws-credentials
+    outputs:
+      context-drift: ${{ steps.synth.outputs.context-drift }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          # A read-only "plan" role is optional; without one, build uses the deploy role.
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN || vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Unit tests
+        run: python -m pytest -v --junitxml=reports/junit.xml
+
+      - name: Synth
+        id: synth
+        # The stack looks up the default VPC at synth time. CI should be served
+        # entirely from the committed cdk.context.json; if synth had to do a
+        # fresh lookup, the deploy would not be reproducible from git.
+        run: |
+          cp cdk.context.json reports/cdk.context.before.json
+          cdk synth --quiet
+          if cmp -s cdk.context.json reports/cdk.context.before.json; then
+            echo "context-drift=false" >> "$GITHUB_OUTPUT"
+          else
+            cp cdk.context.json reports/cdk.context.json
+            echo "context-drift=true" >> "$GITHUB_OUTPUT"
+            echo "::error file=cdk.context.json::cdk synth changed cdk.context.json (new context lookup). Commit reports/cdk.context.json from this run's artifacts so deploys are reproducible."
+          fi
+
+      - name: Static analysis
+        # Fail on errors; warnings are printed but do not break the build.
+        run: cfn-lint --non-zero-exit-code error -- cdk.out/*.template.json
+
+      - name: Diff
+        run: |
+          status=$(aws cloudformation describe-stacks --stack-name CDKToolkit \
+              --query 'Stacks[0].StackStatus' --output text 2>/dev/null || true)
+          case "$status" in
+              CREATE_COMPLETE|UPDATE_COMPLETE|UPDATE_ROLLBACK_COMPLETE)
+                 echo "CDK bootstrap OK ($status)" ;;
+              *) echo "::error::Account/region is not CDK-bootstrapped (CDKToolkit: '${status:-missing}'). Run once: cdk bootstrap aws://<ACCOUNT_ID>/${AWS_REGION}"
+                 exit 1 ;;
+          esac
+          cdk diff --app cdk.out "$STACK_NAME" > reports/cdk-diff.txt 2>&1 \
+              || { cat reports/cdk-diff.txt; exit 1; }
+          cat reports/cdk-diff.txt
+          {
+            echo "### cdk diff — \`$STACK_NAME\` (${AWS_REGION})"
+            echo '```'
+            # Strip ANSI colour codes so the summary renders cleanly.
+            sed 's/\x1b\[[0-9;]*m//g' reports/cdk-diff.txt
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      # Lint and diff still run on drift so the report is complete, but the
+      # build fails here so deploy never runs from an uncommitted lookup.
+      - name: Block deploy on context drift
+        if: steps.synth.outputs.context-drift == 'true'
+        run: exit 1
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: reports
+          path: |
+            reports/
+            cdk.out/*.template.json
+          if-no-files-found: ignore
+
+      - name: Upload cloud assembly
+        uses: actions/upload-artifact@v7
+        with:
+          name: cloud-assembly
+          path: cdk.out/
+          include-hidden-files: true
+          retention-days: 7
+
+  deploy:
+    name: Deploy & Verify
+    needs: build
+    if: >-
+      github.ref == 'refs/heads/main' &&
+      (github.event_name == 'push' ||
+       (github.event_name == 'workflow_dispatch' && inputs.action == 'deploy'))
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Required reviewers on this environment are the manual approval gate.
+    # Review the cdk diff in the build job's summary before approving.
+    environment: production
+    # One writer per stack, shared with destroy.yml. Never cancel a running deploy.
+    concurrency:
+      group: cfn-KafkaSimpleCdkStack-us-east-1
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: ./.github/actions/setup
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Deploy the exact templates that were linted and diffed in build,
+      # rather than re-synthesizing.
+      - name: Download cloud assembly
+        uses: actions/download-artifact@v8
+        with:
+          name: cloud-assembly
+          path: cdk.out
+
+      - name: Deploy
+        run: |
+          cdk deploy --app cdk.out "$STACK_NAME" \
+              --require-approval never \
+              --outputs-file reports/cdk-outputs.json
+
+      - name: Smoke test
+        if: github.event_name != 'workflow_dispatch' || inputs.run_smoke_tests
+        run: bash scripts/smoke_test.sh reports/cdk-outputs.json
+
+      - name: Upload deploy reports
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: deploy-reports
+          path: reports/
+          if-no-files-found: ignore
